@@ -96,7 +96,7 @@ def configure_scope(scope):
     scope.write(":MATH1:FFT:WINDow HANNing")
     scope.write(":MATH1:FFT:UNIT DB")
     scope.write(f":MATH1:FFT:HCENter {FFT_CENTER_HZ}")
-    scope.write(f":MATH1:FFT:HSPan {FFT_SPAN_HZ}")
+    scope.write(f":MATH1:FFT:HSCale {FFT_SPAN_HZ}")   # span
 
     scope.write(":WAVeform:SOURce MATH1")
     scope.write(":WAVeform:MODE NORMal")

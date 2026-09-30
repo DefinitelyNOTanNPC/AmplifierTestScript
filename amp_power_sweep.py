@@ -1,11 +1,15 @@
 """
-RF power sweep: Rigol DG5352 Pro (source) -> DUT -> Rigol MSO8204 (FFT).
+RF power sweep: Rigol DG5352 Pro (source) -> DUT -> Rigol MSO8204 (Vrms).
 
-Steps the generator CH1 (100 MHz sine, 50 ohm) from START_DBM to STOP_DBM.
-At every step the full FFT trace is captured from the scope and saved to CSV.
-If the measured FFT peak reaches STOP_LIMIT_DBM, the generator output is
-switched off immediately. The output is also switched off at the end of the
-sweep and on any error. A Pout vs Pin graph is produced at the end.
+Steps the generator CH1 (100 MHz sine, 50 ohm, dBm) from START_DBM to STOP_DBM.
+At every step the scope measures Vrms on CH1 (50 ohm input) and converts it to
+power: dBm = 10*log10(Vrms^2 / 50 / 1e-3). The CH1 vertical scale is adjusted
+automatically so the signal fills the screen without clipping. The raw CH1
+time-domain waveform is also saved at every step for later analysis.
+
+If the measured power reaches STOP_LIMIT_DBM, the generator output is switched
+off immediately. The output is also switched off at the end of the sweep and on
+any error. A Pout vs Pin graph is produced at the end.
 
 Requirements: pip install pyvisa pyvisa-py numpy matplotlib
 """
@@ -29,16 +33,17 @@ STOP_DBM = -10.0                 # generator sweep end power (dBm)
 STEP_DB = 1.0                  # step size (dB)
 DWELL_S = 0.5                  # time per step (s)
 
-STOP_LIMIT_DBM = 0.0          # turn generator OFF if measured FFT peak >= this
+STOP_LIMIT_DBM = 0.0          # turn generator OFF if measured power >= this
 
-# FFT settings
-FFT_CENTER_HZ = 100e6
-FFT_SPAN_HZ = 200e6
-PEAK_SEARCH_HZ = 5e6           # +/- window around FREQ_HZ used to find the peak
+LOAD_OHMS = 50.0               # scope input impedance used for dBm conversion
 
-# The MSO8204 FFT reports dBVrms. With a 50 ohm input:
-# dBm = dBVrms + 10*log10(1000/50) = dBVrms + 13.01
-DBV_TO_DBM = 13.0103
+# Auto vertical scale: keep the sine peak between these many divisions from
+# centre (the screen is +/-4 div). Range at 50 ohm, 1x probe: 1 mV to 1 V/div.
+TARGET_PEAK_DIV = 3.0
+MIN_PEAK_DIV = 1.5
+MAX_PEAK_DIV = 3.8
+SCALE_STEPS = [1e-3, 2e-3, 5e-3, 10e-3, 20e-3, 50e-3, 100e-3, 200e-3, 500e-3, 1.0]
+SETTLE_S = 0.3                 # wait after a scale change before measuring
 
 OUTPUT_PREFIX = "sweep_" + datetime.now().strftime("%Y%m%d_%H%M%S")
 # ------------------------------------------------------------------------------
@@ -115,20 +120,14 @@ def configure_scope(scope):
     scope.write(":CHANnel1:IMPedance FIFTy")
     scope.write(":CHANnel1:PROBe 1")
     scope.write(":CHANnel1:COUPling DC")
-    scope.write(":CHANnel1:SCALe 0.5")          # V/div, adjust for your levels
-    scope.write(":TIMebase:MAIN:SCALe 1e-6")    # enough cycles for FFT resolution
+    scope.write(":CHANnel1:OFFSet 0")
+    scope.write(f":CHANnel1:SCALe {scale_for_dbm(START_DBM)}")
+    scope.write(":TIMebase:MAIN:SCALe 1e-6")    # 10 us on screen = 1000 cycles
     scope.write(":TRIGger:EDGE:SOURce CHANnel1")
+    scope.write(":TRIGger:EDGE:LEVel 0")
     scope.write(":ACQuire:TYPE NORMal")
 
-    scope.write(":MATH1:DISPlay ON")
-    scope.write(":MATH1:OPERator FFT")
-    scope.write(":MATH1:FFT:SOURce CHANnel1")
-    scope.write(":MATH1:FFT:WINDow HANNing")
-    scope.write(":MATH1:FFT:UNIT DB")
-    scope.write(f":MATH1:FFT:HCENter {FFT_CENTER_HZ}")
-    scope.write(f":MATH1:FFT:HSCale {FFT_SPAN_HZ}")   # span
-
-    scope.write(":WAVeform:SOURce MATH1")
+    scope.write(":WAVeform:SOURce CHANnel1")
     scope.write(":WAVeform:MODE NORMal")
     scope.write(":WAVeform:FORMat ASCii")
     scope.write(":RUN")
@@ -137,12 +136,8 @@ def configure_scope(scope):
 
     checks = {
         ":CHANnel1:IMPedance?": "FIFT",
-        ":MATH1:DISPlay?": "1",
-        ":MATH1:OPERator?": "FFT",
-        ":MATH1:FFT:SOURce?": "CHAN1",
-        ":MATH1:FFT:WINDow?": "HANN",
-        ":MATH1:FFT:UNIT?": "DB",
-        ":WAVeform:SOURce?": "MATH1",
+        ":CHANnel1:PROBe?": "1",
+        ":WAVeform:SOURce?": "CHAN1",
     }
     for cmd, expected in checks.items():
         got = scope.query(cmd).strip().upper()
@@ -150,37 +145,69 @@ def configure_scope(scope):
             raise RuntimeError(f"Scope {cmd} returned {got}, expected {expected}")
 
 
-def fft_axis(scope):
-    """Displayed FFT frequency range (start, stop) in Hz, read back from the scope."""
-    center = float(scope.query(":MATH1:FFT:HCENter?"))
-    span = float(scope.query(":MATH1:FFT:HSCale?"))
-    print(f"Scope FFT: center {center/1e6:.3f} MHz, span {span/1e6:.3f} MHz")
-    return center - span / 2, center + span / 2
+def vrms_to_dbm(vrms):
+    return 10 * np.log10(vrms ** 2 / LOAD_OHMS / 1e-3)
 
 
-def read_fft(scope, f_start, f_stop):
-    """Return (freq_hz, level_dbm) arrays for the FFT trace on screen.
+def dbm_to_vrms(dbm):
+    return np.sqrt(LOAD_OHMS * 1e-3 * 10 ** (dbm / 10))
 
-    The guide does not define the preamble X values for an FFT source, so the
-    frequency axis is spread across the displayed start-stop range.
+
+def scale_for_vpk(vpk):
+    """Smallest V/div that keeps the peak at or below TARGET_PEAK_DIV."""
+    for sc in SCALE_STEPS:
+        if vpk / sc <= TARGET_PEAK_DIV:
+            return sc
+    return SCALE_STEPS[-1]
+
+
+def scale_for_dbm(dbm):
+    return scale_for_vpk(dbm_to_vrms(dbm) * np.sqrt(2))
+
+
+def measure_vrms(scope):
+    """Measure CH1 Vrms, re-ranging the vertical scale until the peak is on screen.
+
+    Returns (vrms, scale). Raises if no valid reading can be made.
     """
+    for _ in range(len(SCALE_STEPS)):
+        scale = float(scope.query(":CHANnel1:SCALe?"))
+        vrms = float(scope.query(":MEASure:ITEM? VRMS,CHANnel1"))
+        vmax = float(scope.query(":MEASure:ITEM? VMAX,CHANnel1"))
+        vmin = float(scope.query(":MEASure:ITEM? VMIN,CHANnel1"))
+        invalid = any(abs(v) > 1e30 for v in (vrms, vmax, vmin))   # 9.9E37 = no reading
+        peak_div = max(abs(vmax), abs(vmin)) / scale if not invalid else float("inf")
+
+        if not invalid and MIN_PEAK_DIV <= peak_div <= MAX_PEAK_DIV:
+            return vrms, scale
+        if invalid or peak_div > MAX_PEAK_DIV:          # clipped: zoom out
+            bigger = [sc for sc in SCALE_STEPS if sc > scale * 1.01]
+            if not bigger:
+                raise RuntimeError(f"Signal exceeds 1 V/div range (Vmax {vmax}, Vmin {vmin})")
+            new = bigger[0]
+        else:                                           # too small: zoom in
+            new = scale_for_vpk(max(abs(vmax), abs(vmin)))
+            if new >= scale:
+                return vrms, scale                      # already at the finest useful scale
+        scope.write(f":CHANnel1:SCALe {new}")
+        time.sleep(SETTLE_S)
+    raise RuntimeError("Could not find a vertical scale with a valid Vrms reading")
+
+
+def read_waveform(scope):
+    """Return (time_s, volts) arrays for the CH1 waveform on screen."""
+    pre = scope.query(":WAVeform:PREamble?").strip().split(",")
+    x_inc, x_org, x_ref = float(pre[4]), float(pre[5]), float(pre[6])
     scope.write(":WAVeform:DATA?")
     raw = scope.read_raw().decode("ascii", errors="ignore").strip()
     if raw.startswith("#"):                     # strip TMC block header
         n = int(raw[1])
         raw = raw[2 + n:]
-    levels = np.array([float(v) for v in raw.split(",") if v.strip()])
-    if levels.size == 0:
-        raise RuntimeError("Scope returned no FFT data")
-    freqs = np.linspace(f_start, f_stop, levels.size)
-    return freqs, levels + DBV_TO_DBM
-
-
-def peak_near(freqs, levels, f0, window):
-    mask = np.abs(freqs - f0) <= window
-    if not mask.any():
-        return float("nan")
-    return float(levels[mask].max())
+    volts = np.array([float(v) for v in raw.split(",") if v.strip()])
+    if volts.size == 0:
+        raise RuntimeError("Scope returned no waveform data")
+    t = (np.arange(volts.size) - x_ref) * x_inc + x_org
+    return t, volts
 
 
 def main():
@@ -190,27 +217,27 @@ def main():
 
     configure_scope(scope)
     configure_generator(gen)
-    f_start, f_stop = fft_axis(scope)
-
     pin_list = np.arange(START_DBM, STOP_DBM + STEP_DB / 2, STEP_DB)
-    results = []                                # (pin, pout)
-    traces_file = f"{OUTPUT_PREFIX}_fft_traces.csv"
+    results = []                                # (pin, vrms, pout, scale)
+    traces_file = f"{OUTPUT_PREFIX}_ch1_waveforms.csv"
 
     try:
         gen.write(":OUTPut1 ON")
         with open(traces_file, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["step", "pin_dbm", "freq_hz", "level_dbm"])
+            w.writerow(["step", "pin_dbm", "time_s", "volts"])
 
             for i, pin in enumerate(pin_list):
                 set_gen_power(gen, pin)
                 time.sleep(DWELL_S)
 
-                freqs, levels = read_fft(scope, f_start, f_stop)
-                pout = peak_near(freqs, levels, FREQ_HZ, PEAK_SEARCH_HZ)
-                results.append((pin, pout))
-                w.writerows([i, pin, fr, lv] for fr, lv in zip(freqs, levels))
-                print(f"Step {i:3d}: Pin {pin:7.2f} dBm  Pout {pout:7.2f} dBm")
+                vrms, scale = measure_vrms(scope)
+                pout = float(vrms_to_dbm(vrms))
+                results.append((pin, vrms, pout, scale))
+                t, volts = read_waveform(scope)
+                w.writerows([i, pin, tt, v] for tt, v in zip(t, volts))
+                print(f"Step {i:3d}: Pin {pin:7.2f} dBm  Vrms {vrms*1e3:8.3f} mV  "
+                      f"Pout {pout:7.2f} dBm  ({scale*1e3:g} mV/div)")
 
                 if pout >= STOP_LIMIT_DBM:
                     print(f"STOP LIMIT reached ({pout:.2f} >= {STOP_LIMIT_DBM} dBm)")
@@ -221,15 +248,15 @@ def main():
     summary_file = f"{OUTPUT_PREFIX}_pout_vs_pin.csv"
     with open(summary_file, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["pin_dbm", "pout_dbm"])
+        w.writerow(["pin_dbm", "vrms_v", "pout_dbm", "scale_v_per_div"])
         w.writerows(results)
 
-    pin, pout = zip(*results)
+    pin, _, pout, _ = zip(*results)
     plt.figure()
     plt.plot(pin, pout, "o-")
     plt.axhline(STOP_LIMIT_DBM, color="r", ls="--", label="STOP limit")
     plt.xlabel("Generator power Pin (dBm)")
-    plt.ylabel(f"Measured FFT peak @ {FREQ_HZ/1e6:.0f} MHz (dBm)")
+    plt.ylabel(f"Measured power into {LOAD_OHMS:g} ohm (dBm)")
     plt.title("Pout vs Pin")
     plt.grid(True)
     plt.legend()

@@ -11,6 +11,7 @@ Requirements: pip install pyvisa pyvisa-py numpy matplotlib
 """
 
 import csv
+import math
 import time
 from datetime import datetime
 
@@ -53,21 +54,48 @@ def open_instr(rm, ip):
     return inst
 
 
+def dbm_to_vpp(dbm):
+    """Convert power into a 50 ohm load (dBm) to peak-to-peak volts."""
+    vrms = math.sqrt(50 * 1e-3 * 10 ** (dbm / 10))
+    return 2 * math.sqrt(2) * vrms
+
+
+def check_errors(inst, name):
+    """Print and clear the instrument error queue."""
+    for _ in range(20):
+        err = inst.query(":SYSTem:ERRor?").strip()
+        if err.startswith(("0", "+0")):
+            return
+        print(f"{name} ERROR: {err}")
+
+
 def configure_generator(gen):
+    # The DG5352 Pro did not honour :VOLTage:UNIT DBM, so the amplitude is sent
+    # in Vpp, calculated from the requested dBm into the 50 ohm load.
     gen.write("*RST")
-    time.sleep(1)
+    gen.query("*OPC?")
     gen.write(":OUTPut1 OFF")
     gen.write(":OUTPut1:IMPedance 50")
     gen.write(":SOURce1:FUNCtion SIN")
     gen.write(f":SOURce1:FREQuency {FREQ_HZ}")
-    gen.write(":SOURce1:VOLTage:UNIT DBM")
-    gen.write(f":SOURce1:VOLTage {START_DBM}")
+    gen.write(":SOURce1:VOLTage:UNIT VPP")
     gen.write(":SOURce1:VOLTage:OFFSet 0")
+    set_gen_power(gen, START_DBM)
     gen.query("*OPC?")
+    check_errors(gen, "Generator")
+
+    imp = gen.query(":OUTPut1:IMPedance?").strip()
+    unit = gen.query(":SOURce1:VOLTage:UNIT?").strip().upper()
+    if float(imp) != 50 or unit != "VPP":
+        raise RuntimeError(f"Generator not configured: impedance={imp}, unit={unit}")
 
 
 def set_gen_power(gen, dbm):
-    gen.write(f":SOURce1:VOLTage {dbm:.2f}")
+    vpp = dbm_to_vpp(dbm)
+    gen.write(f":SOURce1:VOLTage {vpp:.6f}")
+    readback = float(gen.query(":SOURce1:VOLTage?"))
+    if abs(readback - vpp) > 0.01 * vpp:
+        raise RuntimeError(f"Generator amplitude {readback} Vpp, expected {vpp:.6f} Vpp")
 
 
 def gen_off(gen):

@@ -53,21 +53,46 @@ def open_instr(rm, ip):
     return inst
 
 
+def check_errors(inst, name):
+    """Read and clear the error queue; raise if the instrument reported errors."""
+    errors = []
+    for _ in range(20):
+        err = inst.query(":SYSTem:ERRor?").strip()
+        if err.startswith(("0", "+0")):
+            break
+        errors.append(err)
+    if errors:
+        raise RuntimeError(f"{name} reported errors: {errors}")
+
+
 def configure_generator(gen):
+    # Commands per the DG5000 Pro Programming Guide. The load must be set to
+    # 50 ohm (:OUTPut:LOAD) before selecting DBM, as dBm is not available in HighZ.
     gen.write("*RST")
-    time.sleep(1)
+    gen.query("*OPC?")
+    gen.write("*CLS")
     gen.write(":OUTPut1 OFF")
-    gen.write(":OUTPut1:IMPedance 50")
-    gen.write(":SOURce1:FUNCtion SIN")
+    gen.write(":OUTPut1:LOAD 50")
+    gen.write(":SOURce1:FUNCtion SINusoid")
     gen.write(f":SOURce1:FREQuency {FREQ_HZ}")
     gen.write(":SOURce1:VOLTage:UNIT DBM")
-    gen.write(f":SOURce1:VOLTage {START_DBM}")
     gen.write(":SOURce1:VOLTage:OFFSet 0")
     gen.query("*OPC?")
+    check_errors(gen, "Generator")
+
+    load = float(gen.query(":OUTPut1:LOAD?"))
+    unit = gen.query(":SOURce1:VOLTage:UNIT?").strip().upper()
+    if load != 50 or unit != "DBM":
+        raise RuntimeError(f"Generator not configured: load={load} ohm, unit={unit}")
+    set_gen_power(gen, START_DBM)
 
 
 def set_gen_power(gen, dbm):
-    gen.write(f":SOURce1:VOLTage {dbm:.2f}")
+    # Explicit DBM suffix (Table 3.1) so the value can never be taken as Vpp.
+    gen.write(f":SOURce1:VOLTage {dbm:.2f}DBM")
+    readback = float(gen.query(":SOURce1:VOLTage?"))
+    if abs(readback - dbm) > 0.05:
+        raise RuntimeError(f"Generator amplitude reads {readback}, expected {dbm:.2f} dBm")
 
 
 def gen_off(gen):

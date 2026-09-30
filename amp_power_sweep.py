@@ -104,8 +104,13 @@ def gen_off(gen):
 
 
 def configure_scope(scope):
+    # *RST can take several seconds; wait for it to finish so the following
+    # commands are not dropped.
+    scope.timeout = 30000
     scope.write("*RST")
-    time.sleep(2)
+    scope.query("*OPC?")
+    scope.timeout = 10000
+    scope.write("*CLS")
     scope.write(":CHANnel1:DISPlay ON")
     scope.write(":CHANnel1:IMPedance FIFTy")
     scope.write(":CHANnel1:PROBe 1")
@@ -128,18 +133,46 @@ def configure_scope(scope):
     scope.write(":WAVeform:FORMat ASCii")
     scope.write(":RUN")
     scope.query("*OPC?")
+    check_errors(scope, "Scope")
+
+    checks = {
+        ":CHANnel1:IMPedance?": "FIFT",
+        ":MATH1:DISPlay?": "1",
+        ":MATH1:OPERator?": "FFT",
+        ":MATH1:FFT:SOURce?": "CHAN1",
+        ":MATH1:FFT:WINDow?": "HANN",
+        ":MATH1:FFT:UNIT?": "DB",
+        ":WAVeform:SOURce?": "MATH1",
+    }
+    for cmd, expected in checks.items():
+        got = scope.query(cmd).strip().upper()
+        if not got.startswith(expected):
+            raise RuntimeError(f"Scope {cmd} returned {got}, expected {expected}")
 
 
-def read_fft(scope):
-    """Return (freq_hz, level_dbm) arrays for the current FFT trace."""
-    pre = scope.query(":WAVeform:PREamble?").strip().split(",")
-    x_inc, x_org, x_ref = float(pre[4]), float(pre[5]), float(pre[6])
-    raw = scope.query(":WAVeform:DATA?").strip()
-    if raw.startswith("#"):                     # strip IEEE block header
+def fft_axis(scope):
+    """Displayed FFT frequency range (start, stop) in Hz, read back from the scope."""
+    center = float(scope.query(":MATH1:FFT:HCENter?"))
+    span = float(scope.query(":MATH1:FFT:HSCale?"))
+    print(f"Scope FFT: center {center/1e6:.3f} MHz, span {span/1e6:.3f} MHz")
+    return center - span / 2, center + span / 2
+
+
+def read_fft(scope, f_start, f_stop):
+    """Return (freq_hz, level_dbm) arrays for the FFT trace on screen.
+
+    The guide does not define the preamble X values for an FFT source, so the
+    frequency axis is spread across the displayed start-stop range.
+    """
+    scope.write(":WAVeform:DATA?")
+    raw = scope.read_raw().decode("ascii", errors="ignore").strip()
+    if raw.startswith("#"):                     # strip TMC block header
         n = int(raw[1])
         raw = raw[2 + n:]
     levels = np.array([float(v) for v in raw.split(",") if v.strip()])
-    freqs = (np.arange(len(levels)) - x_ref) * x_inc + x_org
+    if levels.size == 0:
+        raise RuntimeError("Scope returned no FFT data")
+    freqs = np.linspace(f_start, f_stop, levels.size)
     return freqs, levels + DBV_TO_DBM
 
 
@@ -157,6 +190,7 @@ def main():
 
     configure_scope(scope)
     configure_generator(gen)
+    f_start, f_stop = fft_axis(scope)
 
     pin_list = np.arange(START_DBM, STOP_DBM + STEP_DB / 2, STEP_DB)
     results = []                                # (pin, pout)
@@ -172,7 +206,7 @@ def main():
                 set_gen_power(gen, pin)
                 time.sleep(DWELL_S)
 
-                freqs, levels = read_fft(scope)
+                freqs, levels = read_fft(scope, f_start, f_stop)
                 pout = peak_near(freqs, levels, FREQ_HZ, PEAK_SEARCH_HZ)
                 results.append((pin, pout))
                 w.writerows([i, pin, fr, lv] for fr, lv in zip(freqs, levels))

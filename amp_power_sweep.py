@@ -204,6 +204,36 @@ def measure_vrms(scope):
     raise RuntimeError("Could not find a vertical scale with a valid Vrms reading")
 
 
+def read_block(inst, cmd):
+    """Send a query and return the payload of its TMC block (#N<len><data>) as bytes.
+
+    Reads until the instrument's END indicator instead of trusting the length
+    in the header, so a short or late block raises a clear error, not a timeout.
+    """
+    inst.write(cmd)
+    term = inst.read_termination
+    inst.read_termination = None                # binary data may contain 0x0A
+    try:
+        raw = inst.read_raw()
+        start = raw.find(b"#")
+        if start >= 0 and len(raw) >= start + 2:
+            ndig = int(raw[start + 1:start + 2])
+            need = start + 2 + ndig + int(raw[start + 2:start + 2 + ndig])
+            while len(raw) < need:              # block arrived in several transfers
+                raw += inst.read_raw()
+    finally:
+        inst.read_termination = term
+    start = raw.find(b"#")
+    if start < 0:
+        raise RuntimeError(f"No data block in reply to {cmd}: {raw[:40]!r}")
+    ndig = int(raw[start + 1:start + 2])
+    length = int(raw[start + 2:start + 2 + ndig])
+    payload = raw[start + 2 + ndig:start + 2 + ndig + length]
+    if len(payload) != length:
+        raise RuntimeError(f"{cmd} block header says {length} bytes, received {len(payload)}")
+    return np.frombuffer(payload, dtype=np.uint8)
+
+
 def read_waveform(scope):
     """Read the full CH1 record from memory. Returns (time_s, volts).
 
@@ -211,19 +241,17 @@ def read_waveform(scope):
     per the guide: volts = (byte - YORigin - YREFerence) * YINCrement.
     """
     scope.write(":STOP")
+    scope.query("*OPC?")                        # wait until acquisition has stopped
     try:
+        scope.write(":WAVeform:STARt 1")
+        scope.write(f":WAVeform:STOP {MEMORY_DEPTH}")
         pre = scope.query(":WAVeform:PREamble?").strip().split(",")
-        points = int(float(pre[2]))
         x_inc, x_org, x_ref = float(pre[4]), float(pre[5]), float(pre[6])
         y_inc, y_org, y_ref = float(pre[7]), float(pre[8]), float(pre[9])
-        scope.write(":WAVeform:STARt 1")
-        scope.write(f":WAVeform:STOP {points}")
-        data = scope.query_binary_values(":WAVeform:DATA?", datatype="B",
-                                         container=np.array)
+        data = read_block(scope, ":WAVeform:DATA?")
+        check_errors(scope, "Scope (waveform read)")
     finally:
         scope.write(":RUN")
-    if data.size == 0:
-        raise RuntimeError("Scope returned no waveform data")
     volts = (data.astype(float) - y_org - y_ref) * y_inc
     t = (np.arange(volts.size) - x_ref) * x_inc + x_org
     return t, volts

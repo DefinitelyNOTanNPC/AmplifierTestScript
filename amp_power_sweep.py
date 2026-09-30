@@ -257,6 +257,24 @@ def read_waveform(scope):
     return t, volts
 
 
+def read_waveform_retry(scope, attempts=3):
+    """read_waveform with retries. Returns None if every attempt fails, so a
+    failed capture skips the waveform/FFT for that step instead of ending the sweep."""
+    for n in range(1, attempts + 1):
+        try:
+            return read_waveform(scope)
+        except (pyvisa.errors.VisaIOError, RuntimeError) as e:
+            print(f"  waveform read failed (attempt {n}/{attempts}): {e}")
+            try:
+                scope.clear()                   # flush any partial reply
+                scope.write(":RUN")
+                time.sleep(SETTLE_S)
+            except pyvisa.errors.VisaIOError:
+                pass
+    print("  WARNING: no waveform saved for this step")
+    return None
+
+
 def spectrum_dbm(t, volts):
     """Single-sided Hann-windowed spectrum in dBm (sine power into LOAD_OHMS)."""
     n = volts.size
@@ -292,9 +310,14 @@ def main():
                 vrms, scale = measure_vrms(scope)
                 pout = float(vrms_to_dbm(vrms))
                 results.append((pin, vrms, pout, scale))
-                t, volts = read_waveform(scope)
-                waveforms.append((i, pin, t, volts))
-                w.writerows([i, pin, tt, v] for tt, v in zip(t, volts))
+                if pout >= STOP_LIMIT_DBM:
+                    gen_off(gen)                # act on the limit before anything else
+
+                wf = read_waveform_retry(scope)
+                if wf is not None:
+                    t, volts = wf
+                    waveforms.append((i, pin, t, volts))
+                    w.writerows([i, pin, tt, v] for tt, v in zip(t, volts))
                 print(f"Step {i:3d}: Pin {pin:7.2f} dBm  Vrms {vrms*1e3:8.3f} mV  "
                       f"Pout {pout:7.2f} dBm  ({scale*1e3:g} mV/div)")
 

@@ -124,6 +124,7 @@ def configure_scope(scope):
     scope.write("*CLS")
     scope.write(":CHANnel1:DISPlay ON")
     scope.write(":CHANnel1:IMPedance FIFTy")
+    scope.write(":CHANnel1:BWLimit OFF")        # full bandwidth for 100 MHz
     scope.write(":CHANnel1:PROBe 1")
     scope.write(":CHANnel1:COUPling DC")
     scope.write(":CHANnel1:OFFSet 0")
@@ -143,6 +144,7 @@ def configure_scope(scope):
 
     checks = {
         ":CHANnel1:IMPedance?": "FIFT",
+        ":CHANnel1:BWLimit?": "OFF",
         ":CHANnel1:PROBe?": "1",
         ":WAVeform:SOURce?": "CHAN1",
     }
@@ -182,6 +184,9 @@ def measure_vrms(scope):
     """
     for _ in range(len(SCALE_STEPS)):
         scale = float(scope.query(":CHANnel1:SCALe?"))
+        bwl = scope.query(":CHANnel1:BWLimit?").strip().upper()
+        if bwl != "OFF":
+            raise RuntimeError(f"Scope CH1 bandwidth limit is {bwl}, must be OFF")
         vrms = float(scope.query(":MEASure:ITEM? VRMS,CHANnel1"))
         vmax = float(scope.query(":MEASure:ITEM? VMAX,CHANnel1"))
         vmin = float(scope.query(":MEASure:ITEM? VMIN,CHANnel1"))
@@ -200,6 +205,7 @@ def measure_vrms(scope):
             if new >= scale:
                 return vrms, scale                      # already at the finest useful scale
         scope.write(f":CHANnel1:SCALe {new}")
+        scope.write(":CHANnel1:BWLimit OFF")
         time.sleep(SETTLE_S)
     raise RuntimeError("Could not find a vertical scale with a valid Vrms reading")
 

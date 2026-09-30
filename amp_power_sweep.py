@@ -19,17 +19,17 @@ import pyvisa
 import matplotlib.pyplot as plt
 
 # ---------------------------------------------------------------- user settings
-SCOPE_IP = "192.168.1.10"      # MSO8204
-GEN_IP = "192.168.1.11"        # DG5352 Pro
+SCOPE_IP = "169.254.174.43"      # MSO8204
+GEN_IP = "169.254.112.67"        # DG5352 Pro
 
 FREQ_HZ = 100e6                # sine frequency
 
-START_DBM = -30.0              # generator start power (dBm)
-STOP_DBM = 0.0                 # generator sweep end power (dBm)
+START_DBM = -35.0              # generator start power (dBm)
+STOP_DBM = -10.0                 # generator sweep end power (dBm)
 STEP_DB = 1.0                  # step size (dB)
 DWELL_S = 0.5                  # time per step (s)
 
-STOP_LIMIT_DBM = 10.0          # turn generator OFF if measured FFT peak >= this
+STOP_LIMIT_DBM = 0.0          # turn generator OFF if measured FFT peak >= this
 
 # FFT settings
 FFT_CENTER_HZ = 100e6

@@ -5,7 +5,8 @@ Steps the generator CH1 (100 MHz sine, 50 ohm, dBm) from START_DBM to STOP_DBM.
 At every step the scope measures Vrms on CH1 (50 ohm input) and converts it to
 power: dBm = 10*log10(Vrms^2 / 50 / 1e-3). The CH1 vertical scale is adjusted
 automatically so the signal fills the screen without clipping. The raw CH1
-time-domain waveform is also saved at every step for later analysis.
+waveform is read from memory at every step, and after the sweep an FFT of each
+waveform is calculated on the PC, saved to CSV and plotted.
 
 If the measured power reaches STOP_LIMIT_DBM, the generator output is switched
 off immediately. The output is also switched off at the end of the sweep and on
@@ -44,6 +45,11 @@ MIN_PEAK_DIV = 1.5
 MAX_PEAK_DIV = 3.8
 SCALE_STEPS = [1e-3, 2e-3, 5e-3, 10e-3, 20e-3, 50e-3, 100e-3, 200e-3, 500e-3, 1.0]
 SETTLE_S = 0.3                 # wait after a scale change before measuring
+
+# Waveform capture: 10k points over 10 us (1 us/div) = 1 GSa/s, so the FFT
+# covers DC to 500 MHz with 100 kHz resolution.
+TIMEBASE_S_PER_DIV = 1e-6
+MEMORY_DEPTH = 10000
 
 OUTPUT_PREFIX = "sweep_" + datetime.now().strftime("%Y%m%d_%H%M%S")
 # ------------------------------------------------------------------------------
@@ -122,14 +128,15 @@ def configure_scope(scope):
     scope.write(":CHANnel1:COUPling DC")
     scope.write(":CHANnel1:OFFSet 0")
     scope.write(f":CHANnel1:SCALe {scale_for_dbm(START_DBM)}")
-    scope.write(":TIMebase:MAIN:SCALe 1e-6")    # 10 us on screen = 1000 cycles
+    scope.write(f":TIMebase:MAIN:SCALe {TIMEBASE_S_PER_DIV}")
+    scope.write(f":ACQuire:MDEPth {MEMORY_DEPTH}")
     scope.write(":TRIGger:EDGE:SOURce CHANnel1")
     scope.write(":TRIGger:EDGE:LEVel 0")
     scope.write(":ACQuire:TYPE NORMal")
 
     scope.write(":WAVeform:SOURce CHANnel1")
-    scope.write(":WAVeform:MODE NORMal")
-    scope.write(":WAVeform:FORMat ASCii")
+    scope.write(":WAVeform:MODE RAW")
+    scope.write(":WAVeform:FORMat BYTE")
     scope.write(":RUN")
     scope.query("*OPC?")
     check_errors(scope, "Scope")
@@ -143,6 +150,9 @@ def configure_scope(scope):
         got = scope.query(cmd).strip().upper()
         if not got.startswith(expected):
             raise RuntimeError(f"Scope {cmd} returned {got}, expected {expected}")
+    mdep = float(scope.query(":ACQuire:MDEPth?"))
+    if mdep != MEMORY_DEPTH:
+        raise RuntimeError(f"Scope memory depth is {mdep:g}, expected {MEMORY_DEPTH}")
 
 
 def vrms_to_dbm(vrms):
@@ -195,19 +205,38 @@ def measure_vrms(scope):
 
 
 def read_waveform(scope):
-    """Return (time_s, volts) arrays for the CH1 waveform on screen."""
-    pre = scope.query(":WAVeform:PREamble?").strip().split(",")
-    x_inc, x_org, x_ref = float(pre[4]), float(pre[5]), float(pre[6])
-    scope.write(":WAVeform:DATA?")
-    raw = scope.read_raw().decode("ascii", errors="ignore").strip()
-    if raw.startswith("#"):                     # strip TMC block header
-        n = int(raw[1])
-        raw = raw[2 + n:]
-    volts = np.array([float(v) for v in raw.split(",") if v.strip()])
-    if volts.size == 0:
+    """Read the full CH1 record from memory. Returns (time_s, volts).
+
+    RAW mode needs the scope stopped; it is restarted afterwards. Conversion
+    per the guide: volts = (byte - YORigin - YREFerence) * YINCrement.
+    """
+    scope.write(":STOP")
+    try:
+        pre = scope.query(":WAVeform:PREamble?").strip().split(",")
+        points = int(float(pre[2]))
+        x_inc, x_org, x_ref = float(pre[4]), float(pre[5]), float(pre[6])
+        y_inc, y_org, y_ref = float(pre[7]), float(pre[8]), float(pre[9])
+        scope.write(":WAVeform:STARt 1")
+        scope.write(f":WAVeform:STOP {points}")
+        data = scope.query_binary_values(":WAVeform:DATA?", datatype="B",
+                                         container=np.array)
+    finally:
+        scope.write(":RUN")
+    if data.size == 0:
         raise RuntimeError("Scope returned no waveform data")
+    volts = (data.astype(float) - y_org - y_ref) * y_inc
     t = (np.arange(volts.size) - x_ref) * x_inc + x_org
     return t, volts
+
+
+def spectrum_dbm(t, volts):
+    """Single-sided Hann-windowed spectrum in dBm (sine power into LOAD_OHMS)."""
+    n = volts.size
+    win = np.hanning(n)
+    amp = 2 * np.abs(np.fft.rfft((volts - volts.mean()) * win)) / win.sum()  # peak V
+    freqs = np.fft.rfftfreq(n, d=t[1] - t[0])
+    vrms = np.maximum(amp / np.sqrt(2), 1e-12)
+    return freqs, vrms_to_dbm(vrms)
 
 
 def main():
@@ -219,6 +248,7 @@ def main():
     configure_generator(gen)
     pin_list = np.arange(START_DBM, STOP_DBM + STEP_DB / 2, STEP_DB)
     results = []                                # (pin, vrms, pout, scale)
+    waveforms = []                              # (step, pin, t, volts)
     traces_file = f"{OUTPUT_PREFIX}_ch1_waveforms.csv"
 
     try:
@@ -235,6 +265,7 @@ def main():
                 pout = float(vrms_to_dbm(vrms))
                 results.append((pin, vrms, pout, scale))
                 t, volts = read_waveform(scope)
+                waveforms.append((i, pin, t, volts))
                 w.writerows([i, pin, tt, v] for tt, v in zip(t, volts))
                 print(f"Step {i:3d}: Pin {pin:7.2f} dBm  Vrms {vrms*1e3:8.3f} mV  "
                       f"Pout {pout:7.2f} dBm  ({scale*1e3:g} mV/div)")
@@ -262,6 +293,28 @@ def main():
     plt.legend()
     plt.savefig(f"{OUTPUT_PREFIX}_pout_vs_pin.png", dpi=150)
     print(f"Saved {traces_file}, {summary_file}, {OUTPUT_PREFIX}_pout_vs_pin.png")
+    plt.show()
+
+    # FFT of every captured waveform
+    spectra_file = f"{OUTPUT_PREFIX}_fft_spectra.csv"
+    plt.figure(figsize=(10, 6))
+    cmap = plt.get_cmap("viridis")
+    with open(spectra_file, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["step", "pin_dbm", "freq_hz", "level_dbm"])
+        for k, (i, p_in, t, volts) in enumerate(waveforms):
+            freqs, level = spectrum_dbm(t, volts)
+            w.writerows([i, p_in, fr, lv] for fr, lv in zip(freqs, level))
+            plt.plot(freqs / 1e6, level, lw=0.8,
+                     color=cmap(k / max(len(waveforms) - 1, 1)),
+                     label=f"{p_in:.0f} dBm")
+    plt.xlabel("Frequency (MHz)")
+    plt.ylabel(f"Level into {LOAD_OHMS:g} ohm (dBm)")
+    plt.title("CH1 spectrum at each step (Pin shown in legend)")
+    plt.grid(True)
+    plt.legend(fontsize=6, ncol=2, loc="upper right")
+    plt.savefig(f"{OUTPUT_PREFIX}_fft_spectra.png", dpi=150)
+    print(f"Saved {spectra_file}, {OUTPUT_PREFIX}_fft_spectra.png")
     plt.show()
 
     scope.close()
